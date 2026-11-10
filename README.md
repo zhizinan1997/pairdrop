@@ -21,7 +21,8 @@
 | `deploy/patch/` | 通过 bind mount 覆盖进容器的前端 / 后端文件 |
 | `deploy/docker-compose.yml` | 服务器上实际使用的 compose 配置，包含 `pairdrop` 与 `coturn-stun` |
 | `deploy/patch-pairdrop.py` | 从上游源文件生成定制补丁的脚本 |
-| `deploy/apply-ws-patch.sh` | 从容器镜像提取原版文件并调用补丁生成器 |
+| `deploy/apply-ws-patch.sh` | 从容器镜像提取原版文件、复制主题并调用补丁生成器，原子替换 `patch/` |
+| `deploy/deploy.sh` | 拉取镜像后重新生成补丁并重建容器 |
 | `deploy/file.zhizinan.top.nginx.conf` | 宝塔站点的 nginx 配置快照 |
 | `deploy/nginx-extension.conf` | EdgeOne 真实客户端 IP 相关扩展配置 |
 | `deploy/eo_setup.py` | 早期 EdgeOne 接入脚本；运行需要 `.secrets/tencentcloud.key`（本仓库不含密钥） |
@@ -39,6 +40,9 @@
 - 设备卡片显示连接方式、速率、预计剩余时间
 - 动画角色设备名、点击菜单、测网速功能
 - WebRTC 优先、失败回退 WebSocket 中转；`?relay` 可强制中转
+- 拖入文件 / 文件夹后显示「拖拽至对应设备图标快捷发送」，再拖到设备图标即可发送；文件夹内容会保留相对路径
+- 零字节文件也能完成传输；局域网 P2P 直连使用更大的分块、受限发送缓冲和 8 分区滑动窗口提升吞吐，服务器中转仍用较保守的窗口
+- 传输时弹出状态窗口，显示方向、当前协议、进度、速率、预计剩余时间与「终止传输」按钮；取消会通知对端并清理双方传输状态
 
 这些改动通过 `deploy/patch/` 下的只读 bind mount 注入容器，并没有直接修改 `upstream/`。
 
@@ -46,6 +50,8 @@
 
 ```text
 /opt/pairdrop/docker-compose.yml        -> deploy/docker-compose.yml
+/opt/pairdrop/deploy.sh                 -> deploy/deploy.sh
+/opt/pairdrop/apply-ws-patch.sh         -> deploy/apply-ws-patch.sh
 /opt/pairdrop/patch-pairdrop.py         -> deploy/patch-pairdrop.py
 /opt/pairdrop/patch/*                   -> deploy/patch/*
 /opt/pairdrop/rtc_config.json           -> deploy/rtc_config.json
@@ -56,9 +62,27 @@
 
 对外域名是 `file.zhizinan.top`，容器只监听 `127.0.0.1:3400`，由本机 nginx 反向代理，再经 EdgeOne 对外提供服务。
 
+## 镜像构建
+
+仓库根目录的 `Dockerfile` 以上游镜像为基础，把 `deploy/patch/` 里 11 个定制文件覆盖进 `/home/node/app`，构建出来的镜像可独立运行，不依赖服务器上的 bind mount。
+
+`.github/workflows/image.yml` 在打 `v*` tag 或手动触发时构建并推送到 GHCR：
+
+```
+ghcr.io/zhizinan1997/pairdrop:<tag>
+ghcr.io/zhizinan1997/pairdrop:latest
+ghcr.io/zhizinan1997/pairdrop:sha-<短哈希>
+```
+
+构建后会用 `grep` 检查镜像里确实带上了 `network.js` 的定制、`index.html` 的传输弹窗和 `apple-theme.css`，避免推出去一个没打补丁的镜像。基础镜像默认取上游 `latest`，也可以在手动触发时通过 `base_image` 指定具体版本。
+
+镜像里的定制文件是构建时固化的；服务器上现有部署仍以 `apply-ws-patch.sh` 重新生成补丁 + bind mount 为准，挂载优先级高于镜像层，两者不冲突。
+
 ## 还原方式
 
-本仓库是源码归档，不是可直接就地启动的完整部署目录。若要重新部署，应先把 `deploy/` 中的文件按服务器路径放回 `/opt/pairdrop`，按 `apply-ws-patch.sh` 的注释从对应镜像重新生成补丁，再使用 `docker compose` 启动；nginx 与 EdgeOne 配置需要单独部署。不要在未核对证书、域名和密钥的情况下直接照搬 nginx 配置。
+本仓库是源码归档，不是可直接就地启动的完整部署目录。若要重新部署，应先把 `deploy/` 中的文件按服务器路径放回 `/opt/pairdrop`，在服务器上执行 `sudo bash deploy.sh`：脚本先拉取 compose 指定的镜像，调用 `apply-ws-patch.sh` 从镜像重新提取原版文件、复制 `apple-theme.css`、运行 `patch-pairdrop.py`，全部成功后原子替换 `patch/`，最后重建容器。补丁生成器使用精确字符串匹配；上游代码变化时会报错退出，需要人工核对定制点。nginx 与 EdgeOne 配置需要单独部署。不要在未核对证书、域名和密钥的情况下直接照搬 nginx 配置。
+
+本地只需核验补丁时，可把 `upstream/` 中的 10 个原版文件复制到临时目录，执行 `python deploy/patch-pairdrop.py <临时目录>`；生成结果应与 `deploy/patch/` 一致，只有 `service-worker.js` 的缓存版本号会在每次生成时递增，以便浏览器丢弃旧缓存。
 
 ## 导出校验
 

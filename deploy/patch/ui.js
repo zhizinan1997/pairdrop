@@ -1,6 +1,79 @@
+// patched: read dropped files / folders synchronously enough to survive the drop event.
+class DroppedFiles {
+    static async fromEvent(e) {
+        const items = [...(e.dataTransfer.items || [])].filter(item => item.kind === 'file');
+        const snapshots = items.map(item => ({
+            file: item.getAsFile && item.getAsFile(),
+            entry: item.webkitGetAsEntry && item.webkitGetAsEntry()
+        })).filter(item => item.file || item.entry);
+        const flatFiles = [...e.dataTransfer.files];
+        const namedFiles = [];
+        const folderPaths = new Set();
+        const folderReads = [];
+
+        const collect = (entry, path) => {
+            const fullPath = path ? path + '/' + entry.name : entry.name;
+            if (entry.isFile) {
+                // getAsFile() only works for top-level entries; children must use entry.file().
+                const snapshot = snapshots.find(item => item.entry === entry && item.file);
+                namedFiles.push(DroppedFiles._withPath(snapshot ? snapshot.file : entry, fullPath));
+                return;
+            }
+            if (!entry.isDirectory || !entry.createReader) return;
+            folderPaths.add(fullPath + '/');
+            const reader = entry.createReader();
+            const children = [];
+            folderReads.push(new Promise(resolve => {
+                const readBatch = () => reader.readEntries(batch => {
+                    if (!batch.length) {
+                        children.forEach(child => collect(child, fullPath));
+                        resolve();
+                        return;
+                    }
+                    children.push(...batch);
+                    readBatch(); // readEntries returns at most 100 entries per call
+                }, error => {
+                    console.error('Cannot read dropped folder:', error);
+                    resolve();
+                });
+                readBatch();
+            }));
+        };
+
+        snapshots.forEach(item => item.entry && collect(item.entry, ''));
+        await Promise.all(folderReads);
+        if (namedFiles.length) {
+            const files = (await Promise.all(namedFiles)).filter(Boolean);
+            if (files.length) return files.sort((a, b) => a.name.localeCompare(b.name));
+        }
+        // An empty folder is dropped: represent it as a zero-byte .keep placeholder so the directory survives.
+        if (folderPaths.size) {
+            return [...folderPaths].sort().map(path => new File([''], path + '.keep', {type: 'text/plain'}));
+        }
+        // Safari / older browsers without the entry API: fall back to the flat FileList.
+        const fallback = flatFiles.length ? flatFiles : snapshots.map(item => item.file).filter(Boolean);
+        return fallback;
+    }
+
+    static async _withPath(fileOrEntry, path) {
+        let file = fileOrEntry;
+        if (fileOrEntry.isFile) {
+            file = await new Promise(resolve => fileOrEntry.file(resolve, error => {
+                console.error('Cannot read dropped file:', error);
+                resolve(null);
+            }));
+        }
+        if (!file) return null;
+        // Preserve folder hierarchy in the name. File.name is immutable, so wrap nested files.
+        if (file.name === path || path.indexOf('/') < 0) return file;
+        return new File([file], path, {type: file.type, lastModified: file.lastModified});
+    }
+}
+
 class PeersUI {
 
     constructor() {
+        window.transferStatusDialog = new TransferStatusDialog(); // patched: live transfer status
         this.$xPeers = $$('x-peers');
         this.$xNoPeers = $$('x-no-peers');
         this.$xInstructions = $$('x-instructions');
@@ -179,7 +252,7 @@ class PeersUI {
         $peer.ui.setProgress(progress.progress, progress.status, progress)
     }
 
-    _onDrop(e) {
+    async _onDrop(e) {
         if (this.shareMode.active || Dialog.anyDialogShown()) return;
 
         e.preventDefault();
@@ -188,11 +261,8 @@ class PeersUI {
 
         if ($$('x-peer') && $$('x-peer').contains(e.target)) return; // dropped on peer
 
-        let files = e.dataTransfer.files;
-        let text = e.dataTransfer.getData("text");
-
-        // convert FileList to Array
-        files = [...files];
+        const text = e.dataTransfer.getData("text");
+        const files = await DroppedFiles.fromEvent(e); // patched: includes whole folders
 
         if (files.length > 0) {
             Events.fire('activate-share-mode', {
@@ -709,16 +779,17 @@ class PeerUI {
         return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
     }
 
-    _onDrop(e) {
+    async _onDrop(e) {
         if (this._shareMode.active || Dialog.anyDialogShown()) return;
 
         e.preventDefault();
+        e.stopPropagation(); // patched: don't also activate the page-wide share mode
 
         this._onDragEnd();
 
         const peerId = this._peer.id;
-        const files = e.dataTransfer.files;
         const text = e.dataTransfer.getData("text");
+        const files = await DroppedFiles.fromEvent(e); // patched: includes whole folders
 
         if (files.length > 0) {
             Events.fire('files-selected', {
@@ -957,6 +1028,85 @@ Events.on('speedtest-incoming', e => {
         }
     });
 });
+
+// patched: live transfer status with a cancel action that stops both peers cleanly
+class TransferStatusDialog {
+    constructor() {
+        this.$el = $('transfer-status-dialog');
+        this.$heading = this.$el.querySelector('.transfer-status-heading');
+        this.$percent = this.$el.querySelector('.transfer-status-percent');
+        this.$bar = this.$el.querySelector('.transfer-status-bar');
+        this.$detail = this.$el.querySelector('.transfer-status-detail');
+        this.$meta = this.$el.querySelector('.transfer-status-meta');
+        this.samples = [];
+        this.active = false;
+
+        this.$el.querySelector('#cancel-transfer').addEventListener('click', () => this.cancel());
+        Events.on('transfer-state', e => this._onState(e.detail));
+        Events.on('transfer-progress', e => this._onProgress(e.detail));
+    }
+
+    static bytes(n) {
+        if (!isFinite(n) || n < 0) n = 0;
+        if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
+        if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+        if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+        return Math.round(n) + ' B';
+    }
+
+    static duration(s) {
+        if (!isFinite(s) || s < 0) return '--:--';
+        s = Math.round(s);
+        const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = String(s % 60).padStart(2, '0');
+        return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+    }
+
+    _onState(detail) {
+        if (detail.state === 'start') {
+            this.active = true;
+            this.detail = detail;
+            this.samples = [];
+            this.$heading.textContent = detail.dir === 'send' ? '正在发送文件' : '正在接收文件';
+            this.$percent.textContent = '0%';
+            this.$bar.style.width = '0%';
+            this.$detail.textContent = `0 B / ${TransferStatusDialog.bytes(detail.totalSize)} · 测速中…`;
+            this.$meta.textContent = detail.protocol === 'ws' ? '服务器中转' : 'P2P 直连';
+            this.$el.setAttribute('show', true);
+        }
+        else if (this.active) {
+            this.active = false;
+            this.$el.removeAttribute('show');
+        }
+    }
+
+    _onProgress(detail) {
+        if (!this.active || !this.detail) return;
+        const progress = Math.max(0, Math.min(1, detail.progress));
+        const total = this.detail.totalSize;
+        const now = performance.now();
+        this.samples.push({t: now, bytes: progress * total});
+        while (this.samples.length > 2 && now - this.samples[0].t > 5000) this.samples.shift();
+        let speedText = '测速中…', etaText = '--:--';
+        const first = this.samples[0], last = this.samples[this.samples.length - 1];
+        if (first && last && last.t - first.t >= 700 && last.bytes > first.bytes) {
+            const speed = (last.bytes - first.bytes) / ((last.t - first.t) / 1000);
+            speedText = TransferStatusDialog.bytes(speed) + '/s';
+            etaText = TransferStatusDialog.duration((total - last.bytes) / speed);
+        }
+        this.$percent.textContent = Math.round(progress * 100) + '%';
+        this.$bar.style.width = (progress * 100) + '%';
+        this.$detail.textContent = `${TransferStatusDialog.bytes(progress * total)} / ${TransferStatusDialog.bytes(total)} · ${speedText}`;
+        this.$meta.textContent = `${detail.protocol === 'ws' ? '服务器中转' : 'P2P 直连'} · 预计剩余 ${etaText}`;
+    }
+
+    cancel() {
+        if (!this.active || !this.detail) return;
+        Events.fire('cancel-transfer', {peerId: this.detail.peerId});
+        this.active = false;
+        this.$el.removeAttribute('show');
+        Events.fire('notify-user', '已终止传输');
+    }
+}
 
 class Dialog {
     constructor(id) {

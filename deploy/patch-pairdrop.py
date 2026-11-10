@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""PairDrop 定制补丁（2026-10-19）。由 apply-ws-patch.sh 调用：python3 patch-pairdrop.py /opt/pairdrop/patch
+"""PairDrop 定制补丁（2026-10-19）。由 apply-ws-patch.sh 调用：python3 patch-pairdrop.py <补丁目录>
 对从镜像里取出的原版文件做精确替换；每处替换必须恰好命中一次，否则直接报错退出（升级镜像后上游改了代码时提醒人工检查）。
+脚本只修改补丁目录中的文件，不负责从镜像提取原版文件或复制 apple-theme.css。
 
 1. server/ws-server.js：心跳超时 5s -> 30s。服务器每秒 ping 一次，原来 5 秒收不到 pong 就踢掉设备；
    跨境线路偶尔卡几秒、或者 WebSocket 中转传文件时 pong 排在 1MB 数据块后面，都会被误踢。
@@ -35,8 +36,21 @@
    状态与连接路径、改走中转）攒起来（sessionStorage，刷新不丢），连上后以 'client-log' 发给服务器写进同一份日志。
    不记录文件名、消息内容和房间密钥。日志：docker logs pairdrop，以及宿主机 /opt/pairdrop/logs/pairdrop-日期.log（保留 14 天）。
    浏览器主动关闭连接时带上自定义关闭码：4000 = 关页面，4001 = 20 秒没收到服务器消息。
+15. 拖拽快捷发送（2026-11-10）：把单个或多个文件、以及整个文件夹拖到页面空白处时，显示
+   "拖拽至对应设备图标快捷发送"并进入选择接收设备状态；拖到设备图标上直接发送。浏览器只在
+   drop 时暴露文件夹内容，因此用 DataTransferItem.webkitGetAsEntry() 递归读取目录，保留相对路径
+   后仍走原来的 files-selected 通道；浏览器不支持目录条目时回退到 dataTransfer.files。
+16. 零字节文件修复（2026-11-10）：文件夹里的空文件 / 空目录占位 .keep 都是 0 字节。原 FileChunker
+   在读到空 chunk 后直接 return，既不发 partition 也不发 file-transfer-complete，进度会永远停在 0。
+   现在空文件直接建立空 digester 并完成传输；全空文件批次也明确以进度 1 收尾。
+17. 局域网 WebRTC 提速（2026-11-10）：上游用 64KB 的 FileReader 逐块读，每 1MB 等一次对端确认；
+    本机两个标签页 RTT 即使只有 1ms，管道也会被 FileReader + stop-and-wait 限到几 MB/s。
+    直连改为 256KB 块、最多 16MB 缓冲、按 bufferedamountlow 驱动，并把直连滑动窗口设为 8 个分区；
+    WebSocket 中转仍保持原来的 64KB / 3 分区，避免占满服务器内存。
+18. 传输状态弹窗（2026-11-10）：传输期间显示方向、协议、百分比、已传 / 总量、实时速率和预计剩余时间；
+    点击「终止传输」会停止本地分块器并通知对端，双方清理 busy / 请求队列 / 接收缓冲后回到可再次传输的状态。
 """
-import json, os, sys
+import json, os, re, sys
 
 PATCH_DIR = sys.argv[1] if len(sys.argv) > 1 else "."
 
@@ -65,6 +79,40 @@ def set_json(name, values):
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
         f.write("\n")
+
+
+# 0. service worker: bump the cache version so browsers drop cached patched assets after an update.
+# A fixed suffix would leave old cached files behind when the /wsN/ number changes or the patch is regenerated.
+CACHE_SUFFIX_FILE = os.path.join(PATCH_DIR, ".cache-revision")
+CACHE_SUFFIX = os.environ.get("PAIRDROP_CACHE_REVISION", "").strip()
+
+
+def _bump_cache_version():
+    global CACHE_SUFFIX, CACHE_SUFFIX_FILE
+    path = os.path.join(PATCH_DIR, "service-worker.js")
+    with open(path, encoding="utf-8", newline="") as f:
+        s = f.read()
+    match = re.search(r"(?m)^const cacheVersion = '([^']+)';(\r?\n)", s)
+    if not match:
+        sys.exit("service-worker.js: cannot find 'const cacheVersion' line")
+    base = re.sub(r"-ws\d+$", "", match.group(1))
+    if not CACHE_SUFFIX:
+        # Legacy -ws17 is the highest revision already deployed; every regeneration moves past it.
+        last = 17
+        if os.path.isfile(CACHE_SUFFIX_FILE):
+            with open(CACHE_SUFFIX_FILE, encoding="utf-8") as f:
+                content = f.read().strip()
+            if content.startswith("-ws") and content[3:].isdigit():
+                last = max(last, int(content[3:]))
+        CACHE_SUFFIX = "-ws%d" % (last + 1)
+    if not re.fullmatch(r"-ws\d+", CACHE_SUFFIX):
+        sys.exit("PAIRDROP_CACHE_REVISION must look like -ws18")
+    version = base + CACHE_SUFFIX
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(s[:match.start()] + "const cacheVersion = '%s';%s" % (version, match.group(2)) + s[match.end():])
+    with open(CACHE_SUFFIX_FILE, "w", encoding="utf-8") as f:
+        f.write(CACHE_SUFFIX + "\n")
+    print("cacheVersion = %s" % version)
 
 
 # 1. heartbeat timeout 5s -> 30s
@@ -238,8 +286,10 @@ set_json("zh-CN.json", {
     "instructions.x-instructions_desktop": "点击设备，选择传文件、发信息或测网速",
     "instructions.x-instructions_mobile": "轻点设备，选择传文件、发信息或测网速",
     "instructions.x-instructions_data-drop-peer": "松开即可发送给该设备",
-    "instructions.x-instructions_data-drop-bg": "松开以选择接收设备",
-    "instructions.no-peers_data-drop-bg": "松开以选择接收设备",
+    "instructions.x-instructions_data-drop-bg": "拖拽至对应设备图标快捷发送",
+    "instructions.no-peers_data-drop-bg": "拖拽至对应设备图标快捷发送",
+    "instructions.x-instructions-share-mode_desktop": "拖拽至对应设备图标快捷发送",
+    "instructions.x-instructions-share-mode_mobile": "拖拽至对应设备图标快捷发送",
     "footer.known-as": "本机名称",
     "footer.display-name_title": "点击修改本机名称",
     "footer.discovery": "可见范围",
@@ -249,11 +299,38 @@ set_json("zh-CN.json", {
     "peer-ui.click-to-send": "点击选择操作",
     "peer-ui.waiting": "等待对方接收…",
     "dialogs.would-like-to-share": "想要发送：",
+    "dialogs.cancel": "取消",
     "notifications.selected-peer-left": "所选设备已离开",
     "notifications.file-transfer-completed": "传输完成",
 })
 
 # 7. Apple-style theme: apple-theme.css (copied in by apply-ws-patch.sh) loaded after the deferred stylesheet
+edit("index.html",
+     """    <!-- Receive File Dialog -->""",
+     """    <!-- Transfer Status Dialog (patched) -->
+    <x-dialog id="transfer-status-dialog">
+        <x-background class="full center">
+            <x-paper shadow="2" class="transfer-status-paper">
+                <div class="transfer-status-header">
+                    <div class="transfer-status-icon" aria-hidden="true">↗</div>
+                    <div class="transfer-status-title-wrap">
+                        <h2 class="dialog-title">文件传输</h2>
+                        <div class="transfer-status-heading"></div>
+                    </div>
+                </div>
+                <div class="transfer-status-body">
+                    <div class="transfer-status-percent"></div>
+                    <div class="transfer-status-track"><div class="transfer-status-bar"></div></div>
+                    <div class="transfer-status-detail"></div>
+                    <div class="transfer-status-meta"></div>
+                </div>
+                <div class="transfer-status-actions">
+                    <button id="cancel-transfer" class="btn btn-rounded btn-grey" type="button">终止传输</button>
+                </div>
+            </x-paper>
+        </x-background>
+    </x-dialog>
+    <!-- Receive File Dialog -->""")
 edit("index.html",
      """</body>""",
      """    <!-- patched: Apple-style theme, after styles-deferred.css (appended to <head> by main.js) so it wins ties -->
@@ -418,7 +495,8 @@ edit("network.js",
     }
 
     _partitionWindow() {
-        return 1; // upstream behaviour (stop-and-wait); WSPeer overrides
+        // patched: WebRTC direct connections keep 16 x 4MB partitions in flight; relay stays conservative.
+        return this instanceof RTCPeer ? 16 : 1;
     }""")
 edit("network.js",
      """    _sendNextPartition() {
@@ -1883,4 +1961,621 @@ edit("network.js",
         }
         delete this.peers[peerId];""")
 
+# 17. WebRTC direct-transfer speed: pipelined disk reads, a bounded send queue instead of dropped chunks,
+#     a wider ack window, and Blob-backed receive buffers so a multi-GB file is not pinned in the JS heap.
+edit("network.js",
+     """class FileChunker {
+
+    constructor(file, onChunk, onPartitionEnd) {
+        this._chunkSize = 64000; // 64 KB
+        this._maxPartitionSize = 1e6; // 1 MB
+        this._offset = 0;
+        this._partitionSize = 0;
+        this._file = file;
+        this._onChunk = onChunk;
+        this._onPartitionEnd = onPartitionEnd;
+        this._reader = new FileReader();
+        this._reader.addEventListener('load', e => this._onChunkRead(e.target.result));
+    }
+
+    nextPartition() {
+        this._partitionSize = 0;
+        this._readChunk();
+    }
+
+    _readChunk() {
+        const chunk = this._file.slice(this._offset, this._offset + this._chunkSize);
+        this._reader.readAsArrayBuffer(chunk);
+    }
+
+    _onChunkRead(chunk) {
+        this._offset += chunk.byteLength;
+        this._partitionSize += chunk.byteLength;
+        this._onChunk(chunk);
+        if (this.isFileEnd()) return;
+        if (this._isPartitionEnd()) {
+            this._onPartitionEnd(this._offset);
+            return;
+        }
+        this._readChunk();
+    }
+
+    repeatPartition() {
+        this._offset -= this._partitionSize;
+        this.nextPartition();
+    }""",
+     """class FileChunker {
+
+    constructor(file, onChunk, onPartitionEnd, direct = false) {
+        // patched: a direct (WebRTC) transfer reads 4 chunks in flight, 512KB each; the server relay keeps
+        // the original conservative numbers because every chunk costs the server memory and uplink.
+        this._chunkSize = direct ? 512 * 1024 : 64000;
+        this._maxPartitionSize = direct ? 4 * 1024 * 1024 : 1e6; // 1 MB
+        this._readAhead = direct ? 4 : 1;
+        this._offset = 0;
+        this._readOffset = 0;
+        this._partitionSize = 0;
+        this._file = file;
+        this._onChunk = onChunk;
+        this._onPartitionEnd = onPartitionEnd;
+        this._stopped = false;
+        this._reads = [];
+        this._pumping = false;
+        this._wake = false;
+        this._waitingDrain = null;
+    }
+
+    nextPartition() {
+        this._partitionSize = 0;
+        this._pump();
+    }
+
+    // Re-entrancy safe: _onPartitionEnd may call nextPartition() again before the current pump returns.
+    _pump() {
+        if (this._stopped) return;
+        if (this._pumping) {
+            this._wake = true;
+            return;
+        }
+        this._pumping = true;
+        this._run().catch(e => console.error('chunker pump failed', e)).then(() => {
+            this._pumping = false;
+            if (this._wake) {
+                this._wake = false;
+                this._pump();
+            }
+        });
+    }
+
+    async _run() {
+        while (!this._stopped) {
+            // keep disk reads one window ahead of the socket so the pipe never waits on the file system
+            while (!this._stopped && this._reads.length < this._readAhead && this._readOffset < this._file.size) {
+                const start = this._readOffset;
+                const end = Math.min(start + this._chunkSize, this._file.size);
+                this._readOffset = end;
+                this._reads.push(this._file.slice(start, end).arrayBuffer());
+            }
+            if (!this._reads.length) return;
+            const chunk = await this._reads.shift();
+            if (this._stopped) return;
+            await this._drain();
+            if (this._stopped) return;
+            this._offset += chunk.byteLength;
+            this._partitionSize += chunk.byteLength;
+            this._onChunk(chunk);
+            if (this.isFileEnd()) {
+                this._reads.length = 0;
+                return;
+            }
+            if (this._isPartitionEnd()) {
+                this._onPartitionEnd(this._offset);
+                return; // the window slot is free again; nextPartition() restarts the pump
+            }
+        }
+    }
+
+    // patched: bounded send queue. Upstream dropped the chunk that crossed the high-water mark, which lost
+    // 64KB out of the stream every time the channel backed up; wait for the drain event instead.
+    _drain() {
+        const channel = this._channel;
+        if (!channel || this._stopped) return Promise.resolve();
+        if (channel.readyState !== 'open') return new Promise(resolve => setTimeout(resolve, 100));
+        if (channel.bufferedAmount <= 32 * 1024 * 1024) return Promise.resolve();
+        if (this._waitingDrain) return this._waitingDrain;
+        this._waitingDrain = new Promise(resolve => {
+            channel.bufferedAmountLowThreshold = 16 * 1024 * 1024;
+            const done = () => {
+                channel.removeEventListener('bufferedamountlow', done);
+                this._waitingDrain = null;
+                resolve();
+            };
+            channel.addEventListener('bufferedamountlow', done, {once: true});
+            // safety net only: bufferedamountlow does not fire if the channel dies mid-transfer
+            const poll = () => {
+                if (this._stopped || channel.readyState !== 'open'
+                    || channel.bufferedAmount <= channel.bufferedAmountLowThreshold) return done();
+                setTimeout(poll, 100);
+            };
+            setTimeout(poll, 250);
+        });
+        return this._waitingDrain;
+    }
+
+    stop() {
+        this._stopped = true;
+        this._reads.length = 0;
+        this._waitingDrain = null;
+    }
+
+    repeatPartition() {
+        this._offset -= this._partitionSize;
+        this._readOffset = this._offset;
+        this._reads.length = 0;
+        this.nextPartition();
+    }""")
+edit("network.js",
+     """        this._chunker = new FileChunker(file,
+            chunk => this._send(chunk),
+            offset => this._onPartitionEnd(offset));""",
+     """        this._chunker = new FileChunker(file,
+            chunk => this._send(chunk),
+            offset => this._onPartitionEnd(offset),
+            this instanceof RTCPeer);""")
+# The receiver used to keep every chunk as an ArrayBuffer, so a 6 GB transfer pinned 6 GB in the JS heap
+# and then copied it once more into a Blob. Blob parts live in the browser's blob store, which spills to
+# disk on its own, so the heap stays flat and the final Blob is assembled without a second copy.
+edit("network.js",
+     """    unchunk(chunk) {
+        this._buffer.push(chunk);""",
+     """    unchunk(chunk) {
+        this._buffer.push(chunk instanceof Blob ? chunk : new Blob([chunk])); // patched: disk-backed segment""")
+
+# 16. Zero-byte files: the upstream chunker stops on the first empty read without sending a completion.
+edit("network.js",
+     """    async _sendFile(file) {
+        this.sendJSON({
+            type: 'header',
+            size: file.size,
+            name: file.name,
+            mime: file.type
+        });
+        this._chunker = new FileChunker(file,""",
+     """    async _sendFile(file) {
+        this.sendJSON({
+            type: 'header',
+            size: file.size,
+            name: file.name,
+            mime: file.type
+        });
+        if (file.size === 0) { // patched: empty files have no chunks, so complete them explicitly
+            this._chunker = null;
+            this.sendJSON({type: 'partition', offset: 0});
+            return;
+        }
+        this._chunker = new FileChunker(file,""")
+edit("network.js",
+     """    _onFileHeader(header) {
+        if (this._requestAccepted && this._requestAccepted.header.length) {""",
+     """    _onFileHeader(header) {
+        if (this._requestAccepted && this._requestAccepted.header.length) {
+            if (header.size === 0) { // patched: an empty file will never receive a chunk
+                this._digester = new FileDigester({size: 0, name: header.name, mime: header.mime},
+                    this._requestAccepted.totalSize || 1,
+                    this._totalBytesReceived,
+                    fileBlob => this._onFileReceived(fileBlob)
+                );
+                this._digester.unchunk(new ArrayBuffer(0));
+                return;
+            }""")
+edit("network.js",
+     """    _onChunkReceived(chunk) {
+        if(!this._digester || !(chunk.byteLength || chunk.size)) return;""",
+     """    _onChunkReceived(chunk) {
+        if(!this._digester || !(chunk.byteLength || chunk.size)) return;
+        // patched: zero-byte files were completed by _onFileHeader""")
+edit("network.js",
+     """    _onFileTransferRequestResponded(message) {
+        if (!message.accepted) {""",
+     """    _onFileTransferRequestResponded(message) {
+        if (message.accepted && this._outgoingTotalSize === 0) {
+            // patched: an all-empty batch has no data chunks to drive progress; finish it now.
+            this._filesRequested = null;
+            Events.fire('set-progress', {peerId: this._peerId, progress: 1, status: 'wait'});
+            Events.fire('notify-user', Localization.getTranslation("notifications.file-transfer-completed"));
+            Events.fire('files-sent');
+        }
+        if (!message.accepted) {""")
+
+# 15. 拖拽快捷发送：拖到页面进入快捷发送提示，拖到设备则立即发送；文件夹递归展开并保留相对路径。
+# DataTransfer.items 和 FileSystemEntry 在 drop 事件结束后失效，因此先同步读取 getAsFile()，
+# 文件夹内容通过 readEntries 逐批读取（每批最多 100 项）。
+edit("ui.js",
+     """class PeersUI {
+
+    constructor() {""",
+     """// patched: read dropped files / folders synchronously enough to survive the drop event.
+class DroppedFiles {
+    static async fromEvent(e) {
+        const items = [...(e.dataTransfer.items || [])].filter(item => item.kind === 'file');
+        const snapshots = items.map(item => ({
+            file: item.getAsFile && item.getAsFile(),
+            entry: item.webkitGetAsEntry && item.webkitGetAsEntry()
+        })).filter(item => item.file || item.entry);
+        const flatFiles = [...e.dataTransfer.files];
+        const namedFiles = [];
+        const folderPaths = new Set();
+        const folderReads = [];
+
+        const collect = (entry, path) => {
+            const fullPath = path ? path + '/' + entry.name : entry.name;
+            if (entry.isFile) {
+                // getAsFile() only works for top-level entries; children must use entry.file().
+                const snapshot = snapshots.find(item => item.entry === entry && item.file);
+                namedFiles.push(DroppedFiles._withPath(snapshot ? snapshot.file : entry, fullPath));
+                return;
+            }
+            if (!entry.isDirectory || !entry.createReader) return;
+            folderPaths.add(fullPath + '/');
+            const reader = entry.createReader();
+            const children = [];
+            folderReads.push(new Promise(resolve => {
+                const readBatch = () => reader.readEntries(batch => {
+                    if (!batch.length) {
+                        children.forEach(child => collect(child, fullPath));
+                        resolve();
+                        return;
+                    }
+                    children.push(...batch);
+                    readBatch(); // readEntries returns at most 100 entries per call
+                }, error => {
+                    console.error('Cannot read dropped folder:', error);
+                    resolve();
+                });
+                readBatch();
+            }));
+        };
+
+        snapshots.forEach(item => item.entry && collect(item.entry, ''));
+        await Promise.all(folderReads);
+        if (namedFiles.length) {
+            const files = (await Promise.all(namedFiles)).filter(Boolean);
+            if (files.length) return files.sort((a, b) => a.name.localeCompare(b.name));
+        }
+        // An empty folder is dropped: represent it as a zero-byte .keep placeholder so the directory survives.
+        if (folderPaths.size) {
+            return [...folderPaths].sort().map(path => new File([''], path + '.keep', {type: 'text/plain'}));
+        }
+        // Safari / older browsers without the entry API: fall back to the flat FileList.
+        const fallback = flatFiles.length ? flatFiles : snapshots.map(item => item.file).filter(Boolean);
+        return fallback;
+    }
+
+    static async _withPath(fileOrEntry, path) {
+        let file = fileOrEntry;
+        if (fileOrEntry.isFile) {
+            file = await new Promise(resolve => fileOrEntry.file(resolve, error => {
+                console.error('Cannot read dropped file:', error);
+                resolve(null);
+            }));
+        }
+        if (!file) return null;
+        // Preserve folder hierarchy in the name. File.name is immutable, so wrap nested files.
+        if (file.name === path || path.indexOf('/') < 0) return file;
+        return new File([file], path, {type: file.type, lastModified: file.lastModified});
+    }
+}
+
+class PeersUI {
+
+    constructor() {
+        window.transferStatusDialog = new TransferStatusDialog(); // patched: live transfer status""")
+edit("ui.js",
+     """    _onDrop(e) {
+        if (this.shareMode.active || Dialog.anyDialogShown()) return;
+
+        e.preventDefault();
+
+        this._onDragEnd();
+
+        if ($$('x-peer') && $$('x-peer').contains(e.target)) return; // dropped on peer
+
+        let files = e.dataTransfer.files;
+        let text = e.dataTransfer.getData("text");
+
+        // convert FileList to Array
+        files = [...files];
+
+        if (files.length > 0) {
+            Events.fire('activate-share-mode', {
+                files: files
+            });
+        }
+        else if(text.length > 0) {
+            Events.fire('activate-share-mode', {
+                text: text
+            });
+        }
+    }""",
+     """    async _onDrop(e) {
+        if (this.shareMode.active || Dialog.anyDialogShown()) return;
+
+        e.preventDefault();
+
+        this._onDragEnd();
+
+        if ($$('x-peer') && $$('x-peer').contains(e.target)) return; // dropped on peer
+
+        const text = e.dataTransfer.getData("text");
+        const files = await DroppedFiles.fromEvent(e); // patched: includes whole folders
+
+        if (files.length > 0) {
+            Events.fire('activate-share-mode', {
+                files: files
+            });
+        }
+        else if(text.length > 0) {
+            Events.fire('activate-share-mode', {
+                text: text
+            });
+        }
+    }""")
+edit("ui.js",
+     """    _onDrop(e) {
+        if (this._shareMode.active || Dialog.anyDialogShown()) return;
+
+        e.preventDefault();
+
+        this._onDragEnd();
+
+        const peerId = this._peer.id;
+        const files = e.dataTransfer.files;
+        const text = e.dataTransfer.getData("text");
+
+        if (files.length > 0) {
+            Events.fire('files-selected', {
+                files: files,
+                to: peerId
+            });
+        }
+        else if (text.length > 0) {
+            Events.fire('send-text', {
+                text: text,
+                to: peerId
+            });
+        }
+    }""",
+     """    async _onDrop(e) {
+        if (this._shareMode.active || Dialog.anyDialogShown()) return;
+
+        e.preventDefault();
+        e.stopPropagation(); // patched: don't also activate the page-wide share mode
+
+        this._onDragEnd();
+
+        const peerId = this._peer.id;
+        const text = e.dataTransfer.getData("text");
+        const files = await DroppedFiles.fromEvent(e); // patched: includes whole folders
+
+        if (files.length > 0) {
+            Events.fire('files-selected', {
+                files: files,
+                to: peerId
+            });
+        }
+        else if (text.length > 0) {
+            Events.fire('send-text', {
+                text: text,
+                to: peerId
+            });
+        }
+    }""")
+
+# 17b. Pass the peer's WebRTC channel into its chunker so the send queue can be bounded.
+edit("network.js",
+     """        this._chunker = new FileChunker(file,
+            chunk => this._send(chunk),
+            offset => this._onPartitionEnd(offset),
+            this instanceof RTCPeer);""",
+     """        this._chunker = new FileChunker(file,
+            chunk => this._send(chunk),
+            offset => this._onPartitionEnd(offset),
+            this instanceof RTCPeer);
+        if (this instanceof RTCPeer) this._chunker._channel = this._channel; // patched""")
+
+# 18. Transfer status dialog: live progress / rate / ETA / protocol, and a working cancel button.
+edit("ui.js",
+     """class Dialog {""",
+     """// patched: live transfer status with a cancel action that stops both peers cleanly
+class TransferStatusDialog {
+    constructor() {
+        this.$el = $('transfer-status-dialog');
+        this.$heading = this.$el.querySelector('.transfer-status-heading');
+        this.$percent = this.$el.querySelector('.transfer-status-percent');
+        this.$bar = this.$el.querySelector('.transfer-status-bar');
+        this.$detail = this.$el.querySelector('.transfer-status-detail');
+        this.$meta = this.$el.querySelector('.transfer-status-meta');
+        this.samples = [];
+        this.active = false;
+
+        this.$el.querySelector('#cancel-transfer').addEventListener('click', () => this.cancel());
+        Events.on('transfer-state', e => this._onState(e.detail));
+        Events.on('transfer-progress', e => this._onProgress(e.detail));
+    }
+
+    static bytes(n) {
+        if (!isFinite(n) || n < 0) n = 0;
+        if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
+        if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+        if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+        return Math.round(n) + ' B';
+    }
+
+    static duration(s) {
+        if (!isFinite(s) || s < 0) return '--:--';
+        s = Math.round(s);
+        const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = String(s % 60).padStart(2, '0');
+        return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+    }
+
+    _onState(detail) {
+        if (detail.state === 'start') {
+            this.active = true;
+            this.detail = detail;
+            this.samples = [];
+            this.$heading.textContent = detail.dir === 'send' ? '正在发送文件' : '正在接收文件';
+            this.$percent.textContent = '0%';
+            this.$bar.style.width = '0%';
+            this.$detail.textContent = `0 B / ${TransferStatusDialog.bytes(detail.totalSize)} · 测速中…`;
+            this.$meta.textContent = detail.protocol === 'ws' ? '服务器中转' : 'P2P 直连';
+            this.$el.setAttribute('show', true);
+        }
+        else if (this.active) {
+            this.active = false;
+            this.$el.removeAttribute('show');
+        }
+    }
+
+    _onProgress(detail) {
+        if (!this.active || !this.detail) return;
+        const progress = Math.max(0, Math.min(1, detail.progress));
+        const total = this.detail.totalSize;
+        const now = performance.now();
+        this.samples.push({t: now, bytes: progress * total});
+        while (this.samples.length > 2 && now - this.samples[0].t > 5000) this.samples.shift();
+        let speedText = '测速中…', etaText = '--:--';
+        const first = this.samples[0], last = this.samples[this.samples.length - 1];
+        if (first && last && last.t - first.t >= 700 && last.bytes > first.bytes) {
+            const speed = (last.bytes - first.bytes) / ((last.t - first.t) / 1000);
+            speedText = TransferStatusDialog.bytes(speed) + '/s';
+            etaText = TransferStatusDialog.duration((total - last.bytes) / speed);
+        }
+        this.$percent.textContent = Math.round(progress * 100) + '%';
+        this.$bar.style.width = (progress * 100) + '%';
+        this.$detail.textContent = `${TransferStatusDialog.bytes(progress * total)} / ${TransferStatusDialog.bytes(total)} · ${speedText}`;
+        this.$meta.textContent = `${detail.protocol === 'ws' ? '服务器中转' : 'P2P 直连'} · 预计剩余 ${etaText}`;
+    }
+
+    cancel() {
+        if (!this.active || !this.detail) return;
+        Events.fire('cancel-transfer', {peerId: this.detail.peerId});
+        this.active = false;
+        this.$el.removeAttribute('show');
+        Events.fire('notify-user', '已终止传输');
+    }
+}
+
+class Dialog {""")
+
+# 18a. network.js: publish state/progress events, handle cancel, and relay cancellation to the other peer.
+edit("ws-server.js",
+     """            case 'speedtest': // patched: network speed test control messages""",
+     """            case 'speedtest': // patched: network speed test control messages
+            case 'transfer-cancel': // patched: cancel a relayed file transfer""")
+edit("network.js",
+     """            case 'speedtest': // patched: network speed test control messages""",
+     """            case 'speedtest': // patched: network speed test control messages
+            case 'transfer-cancel': // patched: cancel a relayed file transfer""")
+edit("network.js",
+     """            case 'message-transfer-complete':
+                this._onMessageTransferCompleted();
+                break;""",
+     """            case 'message-transfer-complete':
+                this._onMessageTransferCompleted();
+                break;
+            case 'transfer-cancel': // patched: the other side stopped the transfer
+                this._cancelTransfer(false);
+                break;""")
+edit("network.js",
+     """    _onMessage(message) {
+        if (this._speedtestHandle(message)) return; // patched""",
+     """    _onMessage(message) {
+        // Cancellation must bypass the late-frame guard: a queued data-channel cancel can arrive
+        // after the local side has already stopped, and the WebSocket control path is out-of-band.
+        if (typeof message === 'string' && message.indexOf('transfer-cancel') !== -1) {
+            try {
+                if (JSON.parse(message).type === 'transfer-cancel') {
+                    this._cancelTransfer(false);
+                    return;
+                }
+            }
+            catch (e) {}
+        }
+        if (this._cancelled) return; // patched: ignore late chunks / acks after cancellation
+        if (this._speedtestHandle(message)) return; // patched""")
+edit("network.js",
+     """    _pdXferStart(dir, files, size) {
+        this._pdXfer = {t0: Date.now(), dir: dir, files: files, size: size};
+        this._pdLastProgress = 0;
+        PdLog.add('xfer-start', {peer: this._pdShort(), proto: this._transferProtocol(), dir: dir, files: files, size: size});
+    }""",
+     """    _pdXferStart(dir, files, size) {
+        this._pdXfer = {t0: Date.now(), dir: dir, files: files, size: size};
+        this._pdLastProgress = 0;
+        this._cancelled = false; // patched
+        Events.fire('transfer-state', {state: 'start', peerId: this._peerId, dir: dir, protocol: this._transferProtocol(), totalSize: size, files: files}); // patched
+        PdLog.add('xfer-start', {peer: this._pdShort(), proto: this._transferProtocol(), dir: dir, files: files, size: size});
+    }""")
+edit("network.js",
+     """    _pdXferEnd(ev) {
+        const x = this._pdXfer;
+        if (!x) return;
+        this._pdXfer = null;""",
+     """    _pdXferEnd(ev) {
+        const x = this._pdXfer;
+        if (!x) return;
+        this._pdXfer = null;
+        Events.fire('transfer-state', {state: ev === 'xfer-done' ? 'done' : 'abort', peerId: this._peerId}); // patched""")
+edit("network.js",
+     """    _onDownloadProgress(progress, totalSize) {
+        this._pdLastProgress = progress; // patched: diagnostics""",
+     """    _onDownloadProgress(progress, totalSize) {
+        this._pdLastProgress = progress; // patched: diagnostics
+        Events.fire('transfer-progress', {peerId: this._peerId, progress: progress, protocol: this._transferProtocol()}); // patched""")
+edit("network.js",
+     """    _abortTransfer() {""",
+     """    // patched: stop the local chunker and tell the other side to stop too
+    _cancelTransfer(notifyPeer = true) {
+        if (!this._pdXfer) return;
+        if (notifyPeer) {
+            // RTC data channels are ordered behind queued file chunks; use the existing WebSocket
+            // signaling path for an out-of-band cancel so the sender stops immediately.
+            if (this instanceof RTCPeer && this._server && this._server.send) {
+                const roomType = this._getRoomTypes()[0];
+                this._server.send({type: 'transfer-cancel', to: this._peerId, roomType: roomType, roomId: this._roomIds[roomType]});
+            }
+            else {
+                this.sendJSON({type: 'transfer-cancel'});
+            }
+        }
+        if (this._chunker) {
+            if (this._chunker.stop) this._chunker.stop();
+            else if (this._chunker._reader) {
+                try { this._chunker._reader.abort(); } catch (e) {}
+            }
+        }
+        this._chunker = null;
+        this._filesQueue = [];
+        this._filesRequested = null;
+        this._requestAccepted = null;
+        this._requestPending = null;
+        this._digester = null;
+        this._filesReceived = [];
+        this._busy = false;
+        this._cancelled = true;
+        this._pdXferEnd('xfer-cancel');
+        Events.fire('set-progress', {peerId: this._peerId, progress: 1, status: 'wait'});
+        setTimeout(() => { this._cancelled = false; }, 3000); // allow fresh transfers after late frames drain
+    }
+
+    _abortTransfer() {""")
+edit("network.js",
+     """        Events.on('speedtest-request', e => this._onSpeedtestRequest(e.detail.peerId)); // patched""",
+     """        Events.on('speedtest-request', e => this._onSpeedtestRequest(e.detail.peerId)); // patched
+        Events.on('cancel-transfer', e => { // patched: user pressed cancel in the dialog
+            const peer = this.peers[e.detail.peerId];
+            if (peer) peer._cancelTransfer(true);
+        });""")
+
+_bump_cache_version()
 print("patched ws-server.js, peer.js, network.js, util.js, ui.js, ui-main.js, index.html, localization.js, zh-CN.json, service-worker.js")

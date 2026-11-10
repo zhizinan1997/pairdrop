@@ -20,10 +20,11 @@ services:
     ports:
       - "127.0.0.1:3400:3000"
     volumes:
-      # 强制 WS 中转的客户端补丁，由 apply-ws-patch.sh 生成（原因见该脚本）
-      - ./patch/util.js:/home/node/app/public/scripts/util.js:ro  # 2026-10-20 起只加 ?relay 开关，不再强制 WS
+      # 下面全部由 apply-ws-patch.sh 从镜像原版文件重新生成（详见 patch-pairdrop.py）。
+      # ?relay 强制中转开关 + Service Worker 缓存版本号
+      - ./patch/util.js:/home/node/app/public/scripts/util.js:ro
       - ./patch/service-worker.js:/home/node/app/public/service-worker.js:ro
-      # 心跳 30s、传输速率/剩余时间显示、二进制中转与滑动窗口，由 apply-ws-patch.sh 调 patch-pairdrop.py 生成（2026-10-19）
+      # 心跳 30s、传输速率/剩余时间显示、二进制中转与滑动窗口（2026-10-19）
       - ./patch/network.js:/home/node/app/public/scripts/network.js:ro
       - ./patch/ui.js:/home/node/app/public/scripts/ui.js:ro
       - ./patch/ws-server.js:/home/node/app/server/ws-server.js:ro
@@ -40,7 +41,6 @@ services:
       # 详细连接日志（2026-10-24，patch-pairdrop.py 第 14 节）：按天写 pairdrop-YYYY-MM-DD.log，保留 14 天，重建容器不丢
       - ./logs:/home/node/app/logs
     environment:
-      - WS_SERVER=true
       - WS_FALLBACK=true
       - RTC_CONFIG=/home/node/app/rtc_config.json
       - RATE_LIMIT=false

@@ -2,6 +2,9 @@
 deploy/logs/*.log
 logs/*.log
 
+# Local patch generation state; the deployed Service Worker version lives in deploy/patch/.
+deploy/patch/.cache-revision
+
 # Never commit credentials, keys, tokens or environment files.
 .secrets/
 *.key
@@ -16,3 +19,7 @@ node_modules/
 .DS_Store
 Thumbs.db
 *.swp
+
+# Python 字节码（patch-pairdrop.py 本地校验产生）
+__pycache__/
+*.pyc

@@ -144,6 +144,7 @@ export default class PairDropWsServer {
             case 'display-name-changed':
             case 'ws-chunk':
             case 'speedtest': // patched: network speed test control messages
+            case 'transfer-cancel': // patched: cancel a relayed file transfer
                 // relay ws-fallback
                 if (this._conf.wsFallback) {
                     this._signalAndRelay(sender, message);

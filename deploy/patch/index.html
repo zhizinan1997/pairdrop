@@ -514,6 +514,29 @@
             </x-paper>
         </x-background>
     </x-dialog>
+    <!-- Transfer Status Dialog (patched) -->
+    <x-dialog id="transfer-status-dialog">
+        <x-background class="full center">
+            <x-paper shadow="2" class="transfer-status-paper">
+                <div class="transfer-status-header">
+                    <div class="transfer-status-icon" aria-hidden="true">↗</div>
+                    <div class="transfer-status-title-wrap">
+                        <h2 class="dialog-title">文件传输</h2>
+                        <div class="transfer-status-heading"></div>
+                    </div>
+                </div>
+                <div class="transfer-status-body">
+                    <div class="transfer-status-percent"></div>
+                    <div class="transfer-status-track"><div class="transfer-status-bar"></div></div>
+                    <div class="transfer-status-detail"></div>
+                    <div class="transfer-status-meta"></div>
+                </div>
+                <div class="transfer-status-actions">
+                    <button id="cancel-transfer" class="btn btn-rounded btn-grey" type="button">终止传输</button>
+                </div>
+            </x-paper>
+        </x-background>
+    </x-dialog>
     <!-- Receive File Dialog -->
     <x-dialog id="receive-file-dialog">
         <x-background class="full center">

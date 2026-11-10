@@ -288,6 +288,7 @@ class ServerConnection {
             case 'display-name-changed':
             case 'ws-chunk':
             case 'speedtest': // patched: network speed test control messages
+            case 'transfer-cancel': // patched: cancel a relayed file transfer
                 // ws-fallback
                 if (this._wsConfig.wsFallback) {
                     Events.fire('ws-relay', JSON.stringify(msg));
@@ -632,9 +633,16 @@ class Peer {
             name: file.name,
             mime: file.type
         });
+        if (file.size === 0) { // patched: empty files have no chunks, so complete them explicitly
+            this._chunker = null;
+            this.sendJSON({type: 'partition', offset: 0});
+            return;
+        }
         this._chunker = new FileChunker(file,
             chunk => this._send(chunk),
-            offset => this._onPartitionEnd(offset));
+            offset => this._onPartitionEnd(offset),
+            this instanceof RTCPeer);
+        if (this instanceof RTCPeer) this._chunker._channel = this._channel; // patched
         this._partitionsInFlight = 0; // patched
         this._chunker.nextPartition();
     }
@@ -647,7 +655,8 @@ class Peer {
     }
 
     _partitionWindow() {
-        return 1; // upstream behaviour (stop-and-wait); WSPeer overrides
+        // patched: WebRTC direct connections keep 16 x 4MB partitions in flight; relay stays conservative.
+        return this instanceof RTCPeer ? 16 : 1;
     }
 
     _onReceivedPartitionEnd(offset) {
@@ -667,6 +676,18 @@ class Peer {
     }
 
     _onMessage(message) {
+        // Cancellation must bypass the late-frame guard: a queued data-channel cancel can arrive
+        // after the local side has already stopped, and the WebSocket control path is out-of-band.
+        if (typeof message === 'string' && message.indexOf('transfer-cancel') !== -1) {
+            try {
+                if (JSON.parse(message).type === 'transfer-cancel') {
+                    this._cancelTransfer(false);
+                    return;
+                }
+            }
+            catch (e) {}
+        }
+        if (this._cancelled) return; // patched: ignore late chunks / acks after cancellation
         if (this._speedtestHandle(message)) return; // patched
         if (typeof message !== 'string') {
             this._onChunkReceived(message);
@@ -697,6 +718,9 @@ class Peer {
                 break;
             case 'message-transfer-complete':
                 this._onMessageTransferCompleted();
+                break;
+            case 'transfer-cancel': // patched: the other side stopped the transfer
+                this._cancelTransfer(false);
                 break;
             case 'text':
                 this._onTextReceived(messageJSON);
@@ -894,6 +918,15 @@ class Peer {
 
     _onFileHeader(header) {
         if (this._requestAccepted && this._requestAccepted.header.length) {
+            if (header.size === 0) { // patched: an empty file will never receive a chunk
+                this._digester = new FileDigester({size: 0, name: header.name, mime: header.mime},
+                    this._requestAccepted.totalSize || 1,
+                    this._totalBytesReceived,
+                    fileBlob => this._onFileReceived(fileBlob)
+                );
+                this._digester.unchunk(new ArrayBuffer(0));
+                return;
+            }
             this._lastProgress = 0;
             this._digester = new FileDigester({size: header.size, name: header.name, mime: header.mime},
                 this._requestAccepted.totalSize,
@@ -901,6 +934,40 @@ class Peer {
                 fileBlob => this._onFileReceived(fileBlob)
             );
         }
+    }
+
+    // patched: stop the local chunker and tell the other side to stop too
+    _cancelTransfer(notifyPeer = true) {
+        if (!this._pdXfer) return;
+        if (notifyPeer) {
+            // RTC data channels are ordered behind queued file chunks; use the existing WebSocket
+            // signaling path for an out-of-band cancel so the sender stops immediately.
+            if (this instanceof RTCPeer && this._server && this._server.send) {
+                const roomType = this._getRoomTypes()[0];
+                this._server.send({type: 'transfer-cancel', to: this._peerId, roomType: roomType, roomId: this._roomIds[roomType]});
+            }
+            else {
+                this.sendJSON({type: 'transfer-cancel'});
+            }
+        }
+        if (this._chunker) {
+            if (this._chunker.stop) this._chunker.stop();
+            else if (this._chunker._reader) {
+                try { this._chunker._reader.abort(); } catch (e) {}
+            }
+        }
+        this._chunker = null;
+        this._filesQueue = [];
+        this._filesRequested = null;
+        this._requestAccepted = null;
+        this._requestPending = null;
+        this._digester = null;
+        this._filesReceived = [];
+        this._busy = false;
+        this._cancelled = true;
+        this._pdXferEnd('xfer-cancel');
+        Events.fire('set-progress', {peerId: this._peerId, progress: 1, status: 'wait'});
+        setTimeout(() => { this._cancelled = false; }, 3000); // allow fresh transfers after late frames drain
     }
 
     _abortTransfer() {
@@ -914,6 +981,7 @@ class Peer {
 
     _onChunkReceived(chunk) {
         if(!this._digester || !(chunk.byteLength || chunk.size)) return;
+        // patched: zero-byte files were completed by _onFileHeader
 
         this._digester.unchunk(chunk);
         const progress = this._digester.progress;
@@ -932,6 +1000,7 @@ class Peer {
 
     _onDownloadProgress(progress, totalSize) {
         this._pdLastProgress = progress; // patched: diagnostics
+        Events.fire('transfer-progress', {peerId: this._peerId, progress: progress, protocol: this._transferProtocol()}); // patched
         // patched: totalSize + protocol let PeerUI show speed and ETA
         Events.fire('set-progress', {peerId: this._peerId, progress: progress, status: 'transfer', totalSize: totalSize, protocol: this._transferProtocol()});
     }
@@ -948,6 +1017,8 @@ class Peer {
     _pdXferStart(dir, files, size) {
         this._pdXfer = {t0: Date.now(), dir: dir, files: files, size: size};
         this._pdLastProgress = 0;
+        this._cancelled = false; // patched
+        Events.fire('transfer-state', {state: 'start', peerId: this._peerId, dir: dir, protocol: this._transferProtocol(), totalSize: size, files: files}); // patched
         PdLog.add('xfer-start', {peer: this._pdShort(), proto: this._transferProtocol(), dir: dir, files: files, size: size});
     }
 
@@ -955,6 +1026,7 @@ class Peer {
         const x = this._pdXfer;
         if (!x) return;
         this._pdXfer = null;
+        Events.fire('transfer-state', {state: ev === 'xfer-done' ? 'done' : 'abort', peerId: this._peerId}); // patched
         const secs = (Date.now() - x.t0) / 1000;
         PdLog.add(ev, Object.assign({
             peer: this._pdShort(),
@@ -1008,6 +1080,13 @@ class Peer {
     }
 
     _onFileTransferRequestResponded(message) {
+        if (message.accepted && this._outgoingTotalSize === 0) {
+            // patched: an all-empty batch has no data chunks to drive progress; finish it now.
+            this._filesRequested = null;
+            Events.fire('set-progress', {peerId: this._peerId, progress: 1, status: 'wait'});
+            Events.fire('notify-user', Localization.getTranslation("notifications.file-transfer-completed"));
+            Events.fire('files-sent');
+        }
         if (!message.accepted) {
             PdLog.add('xfer-rejected', {peer: this._pdShort(), proto: this._transferProtocol(), reason: message.reason}); // patched
             Events.fire('set-progress', {peerId: this._peerId, progress: 1, status: 'wait'});
@@ -1389,6 +1468,10 @@ class PeersManager {
         Events.on('ws-relay-binary', e => this._onWsRelayBinary(e.detail)); // patched
         Events.on('ws-config', e => this._onWsConfig(e.detail));
         Events.on('speedtest-request', e => this._onSpeedtestRequest(e.detail.peerId)); // patched
+        Events.on('cancel-transfer', e => { // patched: user pressed cancel in the dialog
+            const peer = this.peers[e.detail.peerId];
+            if (peer) peer._cancelTransfer(true);
+        });
         Events.on('speedtest-answer', e => { // patched: our user answered a speed test request
             const peer = this.peers[e.detail.peerId];
             if (peer) peer.answerSpeedtest(e.detail.id, e.detail.accepted, e.detail.reason);
@@ -1694,42 +1777,112 @@ class PeersManager {
 
 class FileChunker {
 
-    constructor(file, onChunk, onPartitionEnd) {
-        this._chunkSize = 64000; // 64 KB
-        this._maxPartitionSize = 1e6; // 1 MB
+    constructor(file, onChunk, onPartitionEnd, direct = false) {
+        // patched: a direct (WebRTC) transfer reads 4 chunks in flight, 512KB each; the server relay keeps
+        // the original conservative numbers because every chunk costs the server memory and uplink.
+        this._chunkSize = direct ? 512 * 1024 : 64000;
+        this._maxPartitionSize = direct ? 4 * 1024 * 1024 : 1e6; // 1 MB
+        this._readAhead = direct ? 4 : 1;
         this._offset = 0;
+        this._readOffset = 0;
         this._partitionSize = 0;
         this._file = file;
         this._onChunk = onChunk;
         this._onPartitionEnd = onPartitionEnd;
-        this._reader = new FileReader();
-        this._reader.addEventListener('load', e => this._onChunkRead(e.target.result));
+        this._stopped = false;
+        this._reads = [];
+        this._pumping = false;
+        this._wake = false;
+        this._waitingDrain = null;
     }
 
     nextPartition() {
         this._partitionSize = 0;
-        this._readChunk();
+        this._pump();
     }
 
-    _readChunk() {
-        const chunk = this._file.slice(this._offset, this._offset + this._chunkSize);
-        this._reader.readAsArrayBuffer(chunk);
-    }
-
-    _onChunkRead(chunk) {
-        this._offset += chunk.byteLength;
-        this._partitionSize += chunk.byteLength;
-        this._onChunk(chunk);
-        if (this.isFileEnd()) return;
-        if (this._isPartitionEnd()) {
-            this._onPartitionEnd(this._offset);
+    // Re-entrancy safe: _onPartitionEnd may call nextPartition() again before the current pump returns.
+    _pump() {
+        if (this._stopped) return;
+        if (this._pumping) {
+            this._wake = true;
             return;
         }
-        this._readChunk();
+        this._pumping = true;
+        this._run().catch(e => console.error('chunker pump failed', e)).then(() => {
+            this._pumping = false;
+            if (this._wake) {
+                this._wake = false;
+                this._pump();
+            }
+        });
+    }
+
+    async _run() {
+        while (!this._stopped) {
+            // keep disk reads one window ahead of the socket so the pipe never waits on the file system
+            while (!this._stopped && this._reads.length < this._readAhead && this._readOffset < this._file.size) {
+                const start = this._readOffset;
+                const end = Math.min(start + this._chunkSize, this._file.size);
+                this._readOffset = end;
+                this._reads.push(this._file.slice(start, end).arrayBuffer());
+            }
+            if (!this._reads.length) return;
+            const chunk = await this._reads.shift();
+            if (this._stopped) return;
+            await this._drain();
+            if (this._stopped) return;
+            this._offset += chunk.byteLength;
+            this._partitionSize += chunk.byteLength;
+            this._onChunk(chunk);
+            if (this.isFileEnd()) {
+                this._reads.length = 0;
+                return;
+            }
+            if (this._isPartitionEnd()) {
+                this._onPartitionEnd(this._offset);
+                return; // the window slot is free again; nextPartition() restarts the pump
+            }
+        }
+    }
+
+    // patched: bounded send queue. Upstream dropped the chunk that crossed the high-water mark, which lost
+    // 64KB out of the stream every time the channel backed up; wait for the drain event instead.
+    _drain() {
+        const channel = this._channel;
+        if (!channel || this._stopped) return Promise.resolve();
+        if (channel.readyState !== 'open') return new Promise(resolve => setTimeout(resolve, 100));
+        if (channel.bufferedAmount <= 32 * 1024 * 1024) return Promise.resolve();
+        if (this._waitingDrain) return this._waitingDrain;
+        this._waitingDrain = new Promise(resolve => {
+            channel.bufferedAmountLowThreshold = 16 * 1024 * 1024;
+            const done = () => {
+                channel.removeEventListener('bufferedamountlow', done);
+                this._waitingDrain = null;
+                resolve();
+            };
+            channel.addEventListener('bufferedamountlow', done, {once: true});
+            // safety net only: bufferedamountlow does not fire if the channel dies mid-transfer
+            const poll = () => {
+                if (this._stopped || channel.readyState !== 'open'
+                    || channel.bufferedAmount <= channel.bufferedAmountLowThreshold) return done();
+                setTimeout(poll, 100);
+            };
+            setTimeout(poll, 250);
+        });
+        return this._waitingDrain;
+    }
+
+    stop() {
+        this._stopped = true;
+        this._reads.length = 0;
+        this._waitingDrain = null;
     }
 
     repeatPartition() {
         this._offset -= this._partitionSize;
+        this._readOffset = this._offset;
+        this._reads.length = 0;
         this.nextPartition();
     }
 
@@ -1756,7 +1909,7 @@ class FileDigester {
     }
 
     unchunk(chunk) {
-        this._buffer.push(chunk);
+        this._buffer.push(chunk instanceof Blob ? chunk : new Blob([chunk])); // patched: disk-backed segment
         this._bytesReceived += chunk.byteLength || chunk.size;
         this.progress = (this._totalBytesReceived + this._bytesReceived) / this._totalSize;
         if (isNaN(this.progress)) this.progress = 1
