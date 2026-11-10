@@ -74,7 +74,9 @@ ghcr.io/zhizinan1997/pairdrop:latest
 ghcr.io/zhizinan1997/pairdrop:sha-<短哈希>
 ```
 
-构建后会用 `grep` 检查镜像里确实带上了 `network.js` 的定制、`index.html` 的传输弹窗和 `apple-theme.css`，避免推出去一个没打补丁的镜像。基础镜像默认取上游 `latest`，也可以在手动触发时通过 `base_image` 指定具体版本。
+构建后会用 `grep` 检查镜像里确实带上了 `network.js` 的定制、`index.html` 的传输弹窗和 `apple-theme.css`，并打印已发布的架构清单，避免推出去一个没打补丁的镜像。基础镜像默认取上游 `latest`，也可以在手动触发时通过 `base_image` 指定具体版本。
+
+镜像同时构建 `linux/amd64` 与 `linux/arm64`（上游基础镜像两者都提供），x86 服务器和 Oracle Ampere(A1) 这类 ARM 机器用同一个 tag 拉取即可。容器只需要内核架构匹配，宿主机装的是 Ubuntu 还是别的发行版不影响；镜像本身基于 Alpine。
 
 镜像里的定制文件是构建时固化的；服务器上现有部署仍以 `apply-ws-patch.sh` 重新生成补丁 + bind mount 为准，挂载优先级高于镜像层，两者不冲突。
 

@@ -25,6 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 安装 QEMU（跨架构构建 arm64 需要）
+        uses: docker/setup-qemu-action@v3
+
       - uses: docker/setup-buildx-action@v3
 
       - name: 登录 GHCR
@@ -49,7 +52,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          # 上游基础镜像同时提供 amd64 与 arm64；两种架构都出，Oracle 的 Ampere(A1) 实例也能用。
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -61,6 +65,8 @@ jobs:
       - name: 校验镜像里确实带上了定制文件
         run: |
           IMG=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          echo "== 已发布的架构 =="
+          docker buildx imagetools inspect "$IMG" | grep -E 'Platform:' || true
           docker pull "$IMG"
           docker run --rm --entrypoint sh "$IMG" -c \
             'grep -q "patched" public/scripts/network.js && grep -q "transfer-status-dialog" public/index.html && grep -q "apple-theme" public/service-worker.js && echo custom-files-ok'
