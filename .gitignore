@@ -1,0 +1,18 @@
+# Runtime logs may contain visitor IPs, device names and transfer activity.
+deploy/logs/*.log
+logs/*.log
+
+# Never commit credentials, keys, tokens or environment files.
+.secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+
+# Local dependencies and editor / OS artifacts.
+node_modules/
+.DS_Store
+Thumbs.db
+*.swp

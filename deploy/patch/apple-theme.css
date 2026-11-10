@@ -1,0 +1,728 @@
+/*
+ * PairDrop · Apple 风格主题（2026-10-19）
+ * apply-ws-patch.sh 把本文件复制进 patch/，只读挂到 /home/node/app/public/styles/apple-theme.css；
+ * patch-pairdrop.py 让 index.html 在 </body> 前引入它，排在 JS 动态加载的 styles-deferred.css 之后，
+ * 所以与原样式同优先级的规则由本文件生效。只改外观，不改任何行为。
+ */
+
+/* ---------- Tokens ---------- */
+
+body {
+    --primary-color: #007aff;
+    --accent-color: var(--primary-color);
+    --ws-peer-color: transparent;
+
+    /* PairDrop's own light / dark palettes, re-tuned to Apple system colors */
+    --lt-text-color: 29, 29, 31;
+    --lt-bg-color: 245, 245, 247;
+    --lt-bg-color-secondary: rgba(118, 118, 128, 0.12);
+    --lt-dialog-bg-color: rgba(255, 255, 255, 0.86);
+    --lt-badge-color: rgba(118, 118, 128, 0.16);
+    --lt-lang-hr-color: rgba(60, 60, 67, 0.12);
+
+    --dt-text-color: 245, 245, 247;
+    --dt-bg-color: 0, 0, 0;
+    --dt-bg-color-secondary: rgba(118, 118, 128, 0.24);
+    --dt-dialog-bg-color: rgba(36, 36, 38, 0.86);
+    --dt-badge-color: rgba(118, 118, 128, 0.32);
+    --dt-lang-hr-color: rgba(84, 84, 88, 0.6);
+
+    --ap-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", "Segoe UI",
+               "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+    --ap-ease: cubic-bezier(0.32, 0.72, 0, 1);
+    --ap-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+    --ap-blur: saturate(180%) blur(24px);
+
+    /* light */
+    --ap-label: rgb(29, 29, 31);
+    --ap-secondary: rgba(60, 60, 67, 0.62);
+    --ap-fill: rgba(118, 118, 128, 0.12);
+    --ap-fill-strong: rgba(118, 118, 128, 0.2);
+    --ap-surface: rgba(255, 255, 255, 0.72);
+    --ap-surface-solid: rgba(255, 255, 255, 0.9);
+    --ap-hairline: rgba(0, 0, 0, 0.08);
+    --ap-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 6px 20px rgba(0, 0, 0, 0.06);
+    --ap-shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.05), 0 24px 64px rgba(0, 0, 0, 0.16);
+    --ap-avatar: linear-gradient(160deg, #7cc0ff 0%, #2e8fff 45%, #0060df 100%);
+    --ap-avatar-glow: rgba(0, 122, 255, 0.28);
+    --ap-page:
+        radial-gradient(120% 65% at 50% 112%, rgba(0, 122, 255, 0.13) 0%, rgba(0, 122, 255, 0) 62%),
+        radial-gradient(70% 45% at 88% -8%, rgba(175, 82, 222, 0.07) 0%, rgba(175, 82, 222, 0) 70%),
+        radial-gradient(60% 40% at 8% -6%, rgba(90, 200, 250, 0.08) 0%, rgba(90, 200, 250, 0) 70%),
+        linear-gradient(180deg, #fbfbfd 0%, #f2f2f7 100%);
+}
+
+body.dark-theme {
+    --primary-color: #0a84ff;
+    --ap-label: rgb(245, 245, 247);
+    --ap-secondary: rgba(235, 235, 245, 0.6);
+    --ap-fill: rgba(118, 118, 128, 0.24);
+    --ap-fill-strong: rgba(118, 118, 128, 0.36);
+    --ap-surface: rgba(44, 44, 46, 0.62);
+    --ap-surface-solid: rgba(44, 44, 46, 0.9);
+    --ap-hairline: rgba(255, 255, 255, 0.1);
+    --ap-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 6px 20px rgba(0, 0, 0, 0.35);
+    --ap-shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.4), 0 24px 64px rgba(0, 0, 0, 0.6);
+    --ap-avatar: linear-gradient(160deg, #64b5ff 0%, #1f8bff 45%, #0057cc 100%);
+    --ap-avatar-glow: rgba(10, 132, 255, 0.4);
+    --ap-page:
+        radial-gradient(120% 65% at 50% 112%, rgba(10, 132, 255, 0.26) 0%, rgba(10, 132, 255, 0) 62%),
+        radial-gradient(70% 45% at 88% -8%, rgba(191, 90, 242, 0.14) 0%, rgba(191, 90, 242, 0) 70%),
+        radial-gradient(60% 40% at 8% -6%, rgba(100, 210, 255, 0.1) 0%, rgba(100, 210, 255, 0) 70%),
+        linear-gradient(180deg, #000 0%, #0b0b0f 100%);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not(.light-theme) {
+        --primary-color: #0a84ff;
+        --ap-label: rgb(245, 245, 247);
+        --ap-secondary: rgba(235, 235, 245, 0.6);
+        --ap-fill: rgba(118, 118, 128, 0.24);
+        --ap-fill-strong: rgba(118, 118, 128, 0.36);
+        --ap-surface: rgba(44, 44, 46, 0.62);
+        --ap-surface-solid: rgba(44, 44, 46, 0.9);
+        --ap-hairline: rgba(255, 255, 255, 0.1);
+        --ap-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 6px 20px rgba(0, 0, 0, 0.35);
+        --ap-shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.4), 0 24px 64px rgba(0, 0, 0, 0.6);
+        --ap-avatar: linear-gradient(160deg, #64b5ff 0%, #1f8bff 45%, #0057cc 100%);
+        --ap-avatar-glow: rgba(10, 132, 255, 0.4);
+        --ap-page:
+            radial-gradient(120% 65% at 50% 112%, rgba(10, 132, 255, 0.26) 0%, rgba(10, 132, 255, 0) 62%),
+            radial-gradient(70% 45% at 88% -8%, rgba(191, 90, 242, 0.14) 0%, rgba(191, 90, 242, 0) 70%),
+            radial-gradient(60% 40% at 8% -6%, rgba(100, 210, 255, 0.1) 0%, rgba(100, 210, 255, 0) 70%),
+            linear-gradient(180deg, #000 0%, #0b0b0f 100%);
+    }
+}
+
+/* ---------- Page & typography ---------- */
+
+body {
+    font-family: var(--ap-font);
+    color: var(--ap-label);
+    background-color: rgb(var(--bg-color));
+    background-image: var(--ap-page);
+    background-attachment: fixed;
+}
+
+.btn,
+input,
+textarea,
+button {
+    font-family: var(--ap-font);
+}
+
+h2 {
+    color: var(--ap-label);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+}
+
+h3 {
+    color: var(--ap-label);
+    font-weight: 600;
+}
+
+.font-subheading {
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 18px;
+}
+
+.font-body2 {
+    font-size: 12px;
+    line-height: 16px;
+}
+
+::selection {
+    color: #fff;
+    background: var(--primary-color);
+}
+
+/* ---------- Header: frosted round toolbar buttons ---------- */
+
+header .icon {
+    width: 20px;
+    height: 20px;
+}
+
+header > .icon-button,
+#theme-wrapper {
+    color: var(--ap-label);
+    background: var(--ap-surface);
+    -webkit-backdrop-filter: var(--ap-blur);
+    backdrop-filter: var(--ap-blur);
+    box-shadow: inset 0 0 0 0.5px var(--ap-hairline), var(--ap-shadow);
+    border-radius: 20px;
+}
+
+#theme-wrapper::before,
+#theme-wrapper:hover::before {
+    display: none !important;
+}
+
+.icon-button:before {
+    background-color: currentColor;
+}
+
+.icon-button:hover:before {
+    opacity: 0.08;
+}
+
+.icon-button:focus:before {
+    opacity: 0;
+}
+
+.icon-button:focus-visible:before {
+    opacity: 0.14;
+}
+
+/* "files are relayed by the server" notice -> small frosted capsule */
+#websocket-fallback {
+    opacity: 1;
+    align-self: center;
+    margin: 2px auto 0;
+    padding: 5px 14px;
+    border-radius: 999px;
+    font-size: 12px;
+    line-height: 16px;
+    color: var(--ap-secondary);
+    background: var(--ap-surface);
+    -webkit-backdrop-filter: var(--ap-blur);
+    backdrop-filter: var(--ap-blur);
+    box-shadow: inset 0 0 0 0.5px var(--ap-hairline);
+}
+
+#websocket-fallback > span:not(:first-child) {
+    display: none;
+}
+
+/* ---------- Empty state & hints ---------- */
+
+x-no-peers h2 {
+    color: var(--ap-label);
+    font-size: 20px;
+    line-height: 28px;
+    margin-bottom: 6px;
+}
+
+x-no-peers > div {
+    color: var(--ap-secondary);
+    font-size: 14px;
+}
+
+x-no-peers::before {
+    color: var(--ap-label);
+    font-size: 20px;
+    font-weight: 600;
+}
+
+x-instructions {
+    opacity: 1;
+    color: var(--ap-secondary);
+    font-size: 13px;
+    letter-spacing: 0.01em;
+}
+
+/* ---------- Peers: AirDrop-style avatars ---------- */
+
+x-peer {
+    padding: 10px 6px;
+}
+
+x-peer x-icon {
+    --icon-size: 30px;
+    margin-bottom: 8px;
+    transition: transform 380ms var(--ap-spring);
+}
+
+x-peer .icon-wrapper,
+x-peer.ws-peer .icon-wrapper {
+    padding: 17px;
+    border: none;
+    background: var(--ap-avatar);
+    box-shadow: 0 8px 20px var(--ap-avatar-glow), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+    transition: box-shadow 300ms ease;
+}
+
+x-peer.ws-peer,
+x-peer.ws-peer .progress,
+x-peer.ws-peer .highlight-wrapper {
+    margin-top: 0;
+}
+
+/* only one room type is used here, the colored room markers carry no information */
+.highlight-wrapper {
+    display: none;
+}
+
+x-peer:not([status]):hover x-icon,
+x-peer:not([status]):focus x-icon {
+    transform: scale(1.06) translateY(-2px);
+}
+
+x-peer:not([status]):hover .icon-wrapper {
+    box-shadow: 0 12px 28px var(--ap-avatar-glow), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+
+x-peer[drop] x-icon {
+    transform: scale(1.12);
+}
+
+x-peer[drop] .icon-wrapper {
+    box-shadow: 0 0 0 6px rgba(0, 122, 255, 0.18), 0 12px 28px var(--ap-avatar-glow);
+}
+
+x-peer[status] x-icon {
+    opacity: 0.92;
+}
+
+x-peer .name {
+    color: var(--ap-label);
+    margin-top: 2px;
+}
+
+x-peer .device-name,
+x-peer .status {
+    opacity: 1;
+    color: var(--ap-secondary);
+}
+
+x-peer .status {
+    color: var(--primary-color);
+    font-weight: 600;
+}
+
+x-peer .transfer-stats {
+    opacity: 1 !important;
+    color: var(--ap-secondary);
+    font-variant-numeric: tabular-nums;
+    margin-top: 1px;
+}
+
+/* progress: thin Apple-blue ring on a soft track */
+.circle {
+    width: 74px;
+    height: 74px;
+    border-width: 3px;
+    border-color: var(--primary-color);
+}
+
+x-peer[status] label::before {
+    content: '';
+    position: absolute;
+    top: -8px;
+    left: 50%;
+    width: 80px;
+    height: 80px;
+    margin-left: -40px;
+    box-sizing: border-box;
+    border: 3px solid var(--ap-fill-strong);
+    border-radius: 50%;
+    pointer-events: none;
+}
+
+/* ---------- Footer: me + visibility ---------- */
+
+footer {
+    margin: auto 12px 14px;
+}
+
+footer .logo {
+    --icon-size: 64px;
+    margin-top: 0;
+    margin-bottom: 10px;
+    filter: drop-shadow(0 6px 14px var(--ap-avatar-glow));
+}
+
+.known-as-wrapper {
+    color: var(--ap-secondary);
+    font-size: 14px;
+}
+
+#display-name.badge {
+    color: var(--ap-label);
+    background-color: var(--ap-fill);
+    font-weight: 600;
+    height: 24px;
+    line-height: 24px;
+    padding: 0 4px 0 10px;
+    margin-left: 0.2rem;
+}
+
+.edit-pen {
+    color: var(--ap-secondary);
+}
+
+.discovery-wrapper.panel.border {
+    margin-top: 12px;
+    padding: 4px 4px 4px 14px;
+    min-height: 0;
+    border: none;
+    border-radius: 999px;
+    color: var(--ap-secondary);
+    font-size: 13px;
+    background: var(--ap-surface);
+    -webkit-backdrop-filter: var(--ap-blur);
+    backdrop-filter: var(--ap-blur);
+    box-shadow: inset 0 0 0 0.5px var(--ap-hairline), var(--ap-shadow);
+}
+
+.badge {
+    border-radius: 999px;
+    padding: 0 10px;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 22px;
+}
+
+/* ---------- Dialogs: frosted sheets ---------- */
+
+x-dialog x-background {
+    background: rgba(0, 0, 0, 0.3);
+    -webkit-backdrop-filter: blur(10px) saturate(120%);
+    backdrop-filter: blur(10px) saturate(120%);
+}
+
+x-dialog x-paper[shadow] {
+    max-width: 400px;
+    color: var(--ap-label);
+    background-color: var(--dialog-bg-color);
+    -webkit-backdrop-filter: saturate(180%) blur(30px);
+    backdrop-filter: saturate(180%) blur(30px);
+    border-radius: 24px;
+    box-shadow: inset 0 0 0 0.5px var(--ap-hairline), var(--ap-shadow-lg);
+    transition: transform 420ms var(--ap-ease), opacity 220ms ease;
+}
+
+x-dialog:not([show]) x-paper {
+    transform: scale(0.94) translateY(10px);
+    opacity: 0;
+}
+
+x-paper > .row:first-of-type {
+    background-color: transparent;
+    margin-bottom: 0;
+    padding-top: 22px;
+    padding-bottom: 4px;
+}
+
+x-paper .dialog-title {
+    color: var(--ap-label);
+    font-size: 17px;
+    line-height: 24px;
+    font-weight: 600;
+    margin: 0;
+}
+
+x-dialog .badge.display-name {
+    padding: 0;
+    color: var(--ap-label);
+    background: none;
+    font-size: inherit;
+    font-weight: 600;
+}
+
+x-dialog .file-description {
+    color: var(--ap-secondary);
+}
+
+.file-name {
+    font-style: normal;
+    font-weight: 600;
+    color: var(--ap-label);
+    font-size: 15px;
+}
+
+x-dialog .file-size {
+    color: var(--ap-secondary);
+}
+
+.file-preview > img,
+.file-preview > video {
+    border-radius: 14px;
+}
+
+.textarea {
+    border-radius: 14px;
+}
+
+/* ---------- Buttons ---------- */
+
+.btn {
+    font-size: 15px;
+    line-height: 20px;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-transform: none;
+    padding: 0 18px;
+    transition: transform 160ms ease, background-color 200ms ease, opacity 200ms ease;
+}
+
+.btn:before {
+    background-color: currentColor;
+}
+
+.btn:not([disabled]):hover:before {
+    opacity: 0.08;
+}
+
+.btn:focus:before {
+    opacity: 0;
+}
+
+.btn:focus-visible:before {
+    opacity: 0.14;
+}
+
+.btn:not([disabled]):active {
+    transform: scale(0.97);
+}
+
+.btn[disabled] {
+    color: inherit;
+    opacity: 0.35;
+}
+
+.btn-rounded {
+    border-radius: 12px;
+}
+
+.btn-grey {
+    color: var(--primary-color);
+    background-color: var(--ap-fill);
+}
+
+.btn-row .btn {
+    height: 44px;
+    margin: 4px;
+}
+
+x-paper > .btn-row {
+    margin: 8px 14px 16px;
+}
+
+#accept-request,
+#download-btn,
+#share-btn,
+#copy,
+#send-text-dialog button[type="submit"] {
+    color: #fff;
+    background-color: var(--primary-color);
+}
+
+/* ---------- Toast ---------- */
+
+x-toast[shadow],
+x-dialog[show] ~ div x-toast[shadow] {
+    color: var(--ap-label);
+    background-color: var(--ap-surface-solid);
+    -webkit-backdrop-filter: var(--ap-blur);
+    backdrop-filter: var(--ap-blur);
+    border-radius: 16px;
+    box-shadow: inset 0 0 0 0.5px var(--ap-hairline), var(--ap-shadow-lg);
+    font-weight: 500;
+    transition: opacity 250ms ease, transform 450ms var(--ap-ease);
+}
+
+x-toast .icon-button {
+    color: var(--ap-secondary);
+}
+
+/* ---------- Share mode panel ---------- */
+
+.shr-panel {
+    border-radius: 18px;
+    background-image: linear-gradient(160deg, #3d9bff 0%, #0062e0 100%);
+    box-shadow: var(--ap-shadow);
+}
+
+/* ---------- Motion preferences ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        transition-duration: 0.01ms !important;
+        animation-duration: 0.01ms !important;
+    }
+}
+
+/* ---------- Connection mode badge (data-conn is set by network.js: rtc = direct, ws = server relay) ---------- */
+/* a small pill in front of the device name, so the ellipsis cuts the model name instead of the badge */
+
+x-peer[data-conn] .device-name::before {
+    display: inline-block;
+    margin-right: 5px;
+    padding: 0 6px;
+    border-radius: 8px;
+    font-size: 10px;
+    line-height: 15px;
+    font-weight: 600;
+    vertical-align: 0.05em;
+    color: #1f9d43;
+    background: rgba(52, 199, 89, 0.16);
+}
+
+x-peer[data-conn="rtc"] .device-name::before { content: "直连"; }
+
+x-peer[data-conn="ws"] .device-name::before {
+    content: "中转";
+    color: #c77700;
+    background: rgba(255, 159, 10, 0.18);
+}
+
+body.dark-theme x-peer[data-conn="rtc"] .device-name::before { color: #30d158; }
+body.dark-theme x-peer[data-conn="ws"] .device-name::before { color: #ffb340; }
+@media (prefers-color-scheme: dark) {
+    body:not(.light-theme) x-peer[data-conn="rtc"] .device-name::before { color: #30d158; }
+    body:not(.light-theme) x-peer[data-conn="ws"] .device-name::before { color: #ffb340; }
+}
+
+/* ---------- Device action menu (class PeerMenu in ui.js): send files / send message / speed test ---------- */
+
+.peer-menu {
+    position: fixed;
+    z-index: 1000;
+    min-width: 140px;
+    max-width: calc(100vw - 16px);
+    padding: 6px;
+    box-sizing: border-box;
+    border-radius: 16px;
+    color: var(--ap-label);
+    font-family: var(--ap-font);
+    font-size: 15px;
+    background: var(--ap-surface-solid);
+    -webkit-backdrop-filter: var(--ap-blur);
+    backdrop-filter: var(--ap-blur);
+    border: 0.5px solid var(--ap-hairline);
+    box-shadow: var(--ap-shadow-lg);
+    animation: peer-menu-in 180ms var(--ap-ease);
+}
+
+@keyframes peer-menu-in {
+    from { opacity: 0; transform: translateY(-4px) scale(0.96); }
+    to { opacity: 1; transform: none; }
+}
+
+.peer-menu button {
+    display: block;
+    width: 100%;
+    padding: 10px 16px;
+    border: 0;
+    border-radius: 10px;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: center;
+    cursor: pointer;
+}
+
+.peer-menu button:hover,
+.peer-menu button:focus-visible {
+    background: var(--ap-fill);
+    outline: none;
+}
+
+.peer-menu button + button {
+    margin-top: 2px;
+}
+
+.peer-menu .pm-title {
+    padding: 6px 10px 8px;
+    font-weight: 600;
+    text-align: center;
+}
+
+.peer-menu .pm-line {
+    display: flex;
+    justify-content: space-between;
+    gap: 18px;
+    padding: 5px 10px;
+    font-size: 14px;
+}
+
+.peer-menu .pm-line span:first-child {
+    color: var(--ap-secondary);
+}
+
+.peer-menu .pm-line span:last-child {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+}
+
+.peer-menu .pm-note {
+    min-height: 18px;
+    padding: 4px 10px 8px;
+    color: var(--ap-secondary);
+    font-size: 13px;
+    text-align: center;
+}
+
+/* ---------- Speed test consent dialog ---------- */
+
+.peer-ask {
+    position: fixed;
+    inset: 0;
+    z-index: 1100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    box-sizing: border-box;
+    background: rgba(0, 0, 0, 0.28);
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    animation: peer-menu-in 180ms var(--ap-ease);
+}
+
+.peer-ask .pa-card {
+    width: min(320px, 100%);
+    padding: 20px 18px 14px;
+    box-sizing: border-box;
+    border-radius: 20px;
+    color: var(--ap-label);
+    font-family: var(--ap-font);
+    background: var(--ap-surface-solid);
+    -webkit-backdrop-filter: var(--ap-blur);
+    backdrop-filter: var(--ap-blur);
+    border: 0.5px solid var(--ap-hairline);
+    box-shadow: var(--ap-shadow-lg);
+    text-align: center;
+}
+
+.peer-ask .pa-title {
+    margin-bottom: 8px;
+    font-size: 17px;
+    font-weight: 600;
+}
+
+.peer-ask .pa-text {
+    margin-bottom: 16px;
+    color: var(--ap-secondary);
+    font-size: 14px;
+    line-height: 1.45;
+}
+
+.peer-ask .pa-actions {
+    display: flex;
+    gap: 10px;
+}
+
+.peer-ask .pa-actions button {
+    flex: 1;
+    padding: 11px 0;
+    border: 0;
+    border-radius: 12px;
+    color: var(--ap-label);
+    background: var(--ap-fill);
+    font: inherit;
+    font-size: 16px;
+    cursor: pointer;
+}
+
+.peer-ask .pa-actions button.primary {
+    color: #fff;
+    font-weight: 600;
+    background: var(--primary-color);
+}

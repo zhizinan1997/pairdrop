@@ -1,0 +1,8 @@
+{
+    "sdpSemantics": "unified-plan",
+    "iceServers": [
+        {
+            "urls": "stun:132.226.73.207:3478"
+        }
+    ]
+}

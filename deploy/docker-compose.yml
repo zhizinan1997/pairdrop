@@ -1,0 +1,48 @@
+# PairDrop（凤凰城 /opt/pairdrop，2026-10-18）。上游官方镜像 ghcr.io/schlagmichdoch/pairdrop。
+# 只绑 127.0.0.1:3400，由宝塔反代站点 file.zhizinan.top → EdgeOne 对外（同 s2a / gpt 的做法）。
+# WS_FALLBACK=true：P2P（WebRTC）连不上时（跨网、大陆网络常见）经服务器中转文件，否则两端无法互传。
+# 不加入 watchtower 名单：镜像更新手动做（见 deploy.sh）。
+services:
+  # 仅 STUN（2026-10-20）：帮浏览器发现自己的公网地址，不中转任何数据。UDP 3478，需 ufw allow 3478/udp；
+  # OCI 安全列表已放行全部入站。host 网络并只监听内网地址（公网 IP 经 OCI 1:1 NAT 到 10.0.0.128）。
+  coturn:
+    image: coturn/coturn:latest
+    container_name: coturn-stun
+    restart: unless-stopped
+    network_mode: host
+    command: ["-n", "--listening-ip=10.0.0.128", "--listening-port=3478", "--stun-only", "--no-tcp", "--no-tls", "--no-cli", "--fingerprint", "--no-software-attribute", "--simple-log", "--log-file=stdout"]
+  pairdrop:
+    image: ghcr.io/schlagmichdoch/pairdrop:latest
+    container_name: pairdrop
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:3400:3000"
+    volumes:
+      # 强制 WS 中转的客户端补丁，由 apply-ws-patch.sh 生成（原因见该脚本）
+      - ./patch/util.js:/home/node/app/public/scripts/util.js:ro  # 2026-10-20 起只加 ?relay 开关，不再强制 WS
+      - ./patch/service-worker.js:/home/node/app/public/service-worker.js:ro
+      # 心跳 30s、传输速率/剩余时间显示、二进制中转与滑动窗口，由 apply-ws-patch.sh 调 patch-pairdrop.py 生成（2026-10-19）
+      - ./patch/network.js:/home/node/app/public/scripts/network.js:ro
+      - ./patch/ui.js:/home/node/app/public/scripts/ui.js:ro
+      - ./patch/ws-server.js:/home/node/app/server/ws-server.js:ro
+      - ./patch/peer.js:/home/node/app/server/peer.js:ro
+      # 隐藏配对/公共房间/语言/关于按钮，界面固定中文（2026-10-19）
+      - ./patch/index.html:/home/node/app/public/index.html:ro
+      - ./patch/localization.js:/home/node/app/public/scripts/localization.js:ro
+      - ./patch/zh-CN.json:/home/node/app/public/lang/zh-CN.json:ro
+      # Apple 风格主题（2026-10-19）
+      - ./patch/apple-theme.css:/home/node/app/public/styles/apple-theme.css:ro
+      - ./patch/ui-main.js:/home/node/app/public/scripts/ui-main.js:ro
+      # STUN 配置（2026-10-20）：自建 coturn，局域网直连用
+      - ./rtc_config.json:/home/node/app/rtc_config.json:ro
+      # 详细连接日志（2026-10-24，patch-pairdrop.py 第 14 节）：按天写 pairdrop-YYYY-MM-DD.log，保留 14 天，重建容器不丢
+      - ./logs:/home/node/app/logs
+    environment:
+      - WS_SERVER=true
+      - WS_FALLBACK=true
+      - RTC_CONFIG=/home/node/app/rtc_config.json
+      - RATE_LIMIT=false
+      - DEBUG_MODE=false
+      - TZ=Asia/Shanghai
