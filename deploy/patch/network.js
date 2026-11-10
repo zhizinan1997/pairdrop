@@ -638,13 +638,34 @@ class Peer {
             this.sendJSON({type: 'partition', offset: 0});
             return;
         }
+        const direct = this instanceof RTCPeer;
         this._chunker = new FileChunker(file,
             chunk => this._send(chunk),
             offset => this._onPartitionEnd(offset),
-            this instanceof RTCPeer);
-        if (this instanceof RTCPeer) this._chunker._channel = this._channel; // patched
+            direct,
+            direct ? this._rtcChunkSize() : 0);
+        this._chunker._onError = e => this._onSendFailed(e); // patched: a failed send must not stall silently at 0%
+        if (direct) this._chunker._channel = this._channel; // patched
+        if (direct) PdLog.add('xfer-chunk', {peer: this._pdShort(), chunk: this._chunker._chunkSize,
+            max: this._conn && this._conn.sctp ? this._conn.sctp.maxMessageSize : undefined}); // patched
         this._partitionsInFlight = 0; // patched
         this._chunker.nextPartition();
+    }
+
+    // patched: one data-channel message must fit the negotiated SCTP max-message-size (Chrome / Edge: 256 KiB).
+    // The old fixed 512 KiB chunk made RTCDataChannel.send() throw on the first chunk, so every direct transfer hung at 0%.
+    _rtcChunkSize() {
+        const max = this._conn && this._conn.sctp ? this._conn.sctp.maxMessageSize : 0;
+        if (!max) return 64 * 1024; // unknown: the size every WebRTC implementation accepts
+        return Math.min(256 * 1024, max);
+    }
+
+    // patched: the chunker could not send (e.g. channel closed or message too large) -- stop and tell both sides
+    _onSendFailed(e) {
+        PdLog.add('xfer-error', {peer: this._pdShort(), proto: this._transferProtocol(),
+            err: String(e && (e.message || e)).slice(0, 160)});
+        Events.fire('notify-user', '发送失败：' + String(e && (e.message || e)).slice(0, 80));
+        this._cancelTransfer(true);
     }
 
     _onPartitionEnd(offset) {
@@ -1777,10 +1798,11 @@ class PeersManager {
 
 class FileChunker {
 
-    constructor(file, onChunk, onPartitionEnd, direct = false) {
-        // patched: a direct (WebRTC) transfer reads 4 chunks in flight, 512KB each; the server relay keeps
-        // the original conservative numbers because every chunk costs the server memory and uplink.
-        this._chunkSize = direct ? 512 * 1024 : 64000;
+    constructor(file, onChunk, onPartitionEnd, direct = false, chunkSize = 0) {
+        // patched: a direct (WebRTC) transfer reads 4 chunks in flight, each as large as the data channel allows
+        // (Peer._rtcChunkSize, at most 256KB); the server relay keeps the original conservative numbers because
+        // every chunk costs the server memory and uplink.
+        this._chunkSize = direct ? (chunkSize || 64 * 1024) : 64000;
         this._maxPartitionSize = direct ? 4 * 1024 * 1024 : 1e6; // 1 MB
         this._readAhead = direct ? 4 : 1;
         this._offset = 0;
@@ -1809,7 +1831,10 @@ class FileChunker {
             return;
         }
         this._pumping = true;
-        this._run().catch(e => console.error('chunker pump failed', e)).then(() => {
+        this._run().catch(e => {
+            console.error('chunker pump failed', e);
+            if (!this._stopped && this._onError) this._onError(e); // patched: surface it instead of hanging
+        }).then(() => {
             this._pumping = false;
             if (this._wake) {
                 this._wake = false;
@@ -1852,10 +1877,11 @@ class FileChunker {
         const channel = this._channel;
         if (!channel || this._stopped) return Promise.resolve();
         if (channel.readyState !== 'open') return new Promise(resolve => setTimeout(resolve, 100));
-        if (channel.bufferedAmount <= 32 * 1024 * 1024) return Promise.resolve();
+        // Chrome / Edge throw "send queue is full" once bufferedAmount passes 16 MiB, so stay well below it
+        if (channel.bufferedAmount <= 8 * 1024 * 1024) return Promise.resolve();
         if (this._waitingDrain) return this._waitingDrain;
         this._waitingDrain = new Promise(resolve => {
-            channel.bufferedAmountLowThreshold = 16 * 1024 * 1024;
+            channel.bufferedAmountLowThreshold = 4 * 1024 * 1024;
             const done = () => {
                 channel.removeEventListener('bufferedamountlow', done);
                 this._waitingDrain = null;
