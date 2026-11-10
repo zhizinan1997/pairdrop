@@ -78,6 +78,14 @@ ghcr.io/zhizinan1997/pairdrop:sha-<短哈希>
 
 镜像里的定制文件是构建时固化的；服务器上现有部署仍以 `apply-ws-patch.sh` 重新生成补丁 + bind mount 为准，挂载优先级高于镜像层，两者不冲突。
 
+上游镜像基于 Alpine、以 root 运行且没有 `node` 用户，所以 Dockerfile 不设置 `USER`，`ENTRYPOINT` / `CMD` / `WORKDIR` 全部继承上游。推 tag 之前先在本地跑一遍：
+
+```bash
+docker build -t pairdrop-custom:test .
+docker run --rm --entrypoint sh pairdrop-custom:test -c \
+  'grep -q patched public/scripts/network.js && grep -q transfer-status-dialog public/index.html && echo ok'
+```
+
 ## 还原方式
 
 本仓库是源码归档，不是可直接就地启动的完整部署目录。若要重新部署，应先把 `deploy/` 中的文件按服务器路径放回 `/opt/pairdrop`，在服务器上执行 `sudo bash deploy.sh`：脚本先拉取 compose 指定的镜像，调用 `apply-ws-patch.sh` 从镜像重新提取原版文件、复制 `apple-theme.css`、运行 `patch-pairdrop.py`，全部成功后原子替换 `patch/`，最后重建容器。补丁生成器使用精确字符串匹配；上游代码变化时会报错退出，需要人工核对定制点。nginx 与 EdgeOne 配置需要单独部署。不要在未核对证书、域名和密钥的情况下直接照搬 nginx 配置。
